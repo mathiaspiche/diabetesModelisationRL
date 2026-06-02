@@ -19,8 +19,7 @@ START_TIME = datetime(2018, 1, 1, 6, 0, 0)
 
 # ---------------------------------------------------------------------------
 # Networks
-# ---------------------------------------------------------------------------
-
+# ---------------------
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
         super().__init__()
@@ -41,7 +40,6 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        # x: [batch, state_dim] OR [batch, seq_len, state_dim]
         if x.dim() == 3:
             x = x[:, -1, :]  # take latest timestep only
 
