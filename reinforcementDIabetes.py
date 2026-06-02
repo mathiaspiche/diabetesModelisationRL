@@ -324,7 +324,7 @@ if __name__ == "__main__":
             state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
             action = agent.actor(state_t).detach().cpu().numpy()[0]
             noise = np.random.normal(0, explore_noise)
-            action = np.clip(action, [0.0, 0.0], [1.5, 5.0])
+            action = np.clip(action + noise, [0.0, 0.0], [1.5, 5.0])
 
             basal, bolus = float(action[0]), float(action[1])
             old_basal, old_bolus = prev_basal, prev_bolus
