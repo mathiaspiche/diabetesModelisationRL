@@ -17,9 +17,7 @@ print(f"Using device: {device}")
 
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
 
-# ---------------------------------------------------------------------------
-# Networks
-# ---------------------
+
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
         super().__init__()
@@ -41,7 +39,7 @@ class Actor(nn.Module):
 
     def forward(self, x):
         if x.dim() == 3:
-            x = x[:, -1, :]  # take latest timestep only
+            x = x[:, -1, :]
 
         action = self.net(x)
         return action * self.max_action
@@ -65,9 +63,8 @@ class Critic(nn.Module):
         )
 
     def forward(self, x, action):
-        # x: [batch, state_dim] OR [batch, seq_len, state_dim]
         if x.dim() == 3:
-            x = x[:, -1, :]  # keep only latest state
+            x = x[:, -1, :]
 
         return self.net(torch.cat([x, action], dim=1))
 
@@ -93,7 +90,7 @@ class RecurrentTD3Agent:
         self.max_action = torch.tensor([1.5, 5.0], dtype=torch.float32).to(device)
         self.min_action = torch.tensor([0.0, 0.0], dtype=torch.float32).to(device)
 
-        # Networks
+
         self.actor = Actor(state_dim, action_dim, self.max_action).to(device)
         self.actor_target = Actor(state_dim, action_dim, self.max_action).to(device)
 
@@ -103,14 +100,11 @@ class RecurrentTD3Agent:
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
 
-        # Replay buffer (stores sequences now)
         self.replay_buffer = deque(maxlen=200_000)
 
-        # TD3 params
         self.gamma = 0.99
         self.tau = 0.005
         self.policy_noise = 0.15
@@ -118,11 +112,9 @@ class RecurrentTD3Agent:
         self.policy_delay = 2
         self.total_it = 0
 
-    # -----------------------------
     def store_transition(self, state_seq, action, reward, next_state_seq, done):
         self.replay_buffer.append((state_seq, action, reward, next_state_seq, done))
 
-    # -----------------------------
     def train(self, batch_size=128):
         if len(self.replay_buffer) < batch_size:
             return None, None
@@ -139,7 +131,6 @@ class RecurrentTD3Agent:
         rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(device)
         dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(device)
 
-        # ---------------- TARGET ----------------
         with torch.no_grad():
             noise = (torch.randn_like(actions) * self.policy_noise).clamp(
                 -self.noise_clip, self.noise_clip
@@ -152,18 +143,16 @@ class RecurrentTD3Agent:
             q1_t, q2_t = self.critic_target(next_state_seq, next_actions)
             q_target = rewards + self.gamma * (1 - dones) * torch.min(q1_t, q2_t)
 
-        # ---------------- CRITIC ----------------
         q1, q2 = self.critic(state_seq, actions)
         critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # ← add here
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         actor_loss_val = None
 
-        # ---------------- ACTOR ----------------
         if self.total_it % self.policy_delay == 0:
             actor_loss = -self.critic.q1_only(
                 state_seq,
@@ -172,7 +161,7 @@ class RecurrentTD3Agent:
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # ← add here
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
 
             self._soft_update(self.actor, self.actor_target)
@@ -182,7 +171,6 @@ class RecurrentTD3Agent:
 
         return critic_loss.item(), actor_loss_val
 
-    # -----------------------------
     def _soft_update(self, source, target):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(self.tau * sp.data + (1 - self.tau) * tp.data)
@@ -217,23 +205,17 @@ def build_state(
     meal_history
 ):
 
-    # ---------------- CGM ----------------
     cgm_norm = cgm / 400.0
-
-    # ---------------- trend ----------------
     delta = cgm - prev_cgm
     delta2 = cgm - 2 * prev_cgm + prev_prev_cgm
 
     delta_norm = delta / 50.0
     delta2_norm = delta2 / 50.0
 
-    # ---------------- IOB (USE ONLY THIS) ----------------
     iob_norm = min(iob, 3.0) / 3.0
 
-    # ---------------- meals ----------------
     meal_sum = sum(list(meal_history)[-36:]) / 100.0
 
-    # ---------------- previous actions ----------------
     basal_norm = prev_basal / 1.5
     bolus_norm = prev_bolus / 5.0
 
@@ -324,7 +306,7 @@ if __name__ == "__main__":
                 continue
 
             cgm_list = list(cgm_history)
-            delta = current_cgm - cgm_list[-2]  # ← compute delta here
+            delta = current_cgm - cgm_list[-2]
 
             state = build_state(
                 cgm=current_cgm,
@@ -339,30 +321,27 @@ if __name__ == "__main__":
             state_buffer.append(state)
             state_seq = np.array(state_buffer, dtype=np.float32)
 
-            # ---------------- ACTION ----------------
             state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
             action = agent.actor(state_t).detach().cpu().numpy()[0]
             noise = np.random.normal(0, explore_noise)
             action = np.clip(action, [0.0, 0.0], [1.5, 5.0])
 
             basal, bolus = float(action[0]), float(action[1])
-            old_basal, old_bolus = prev_basal, prev_bolus  # ← save before update
+            old_basal, old_bolus = prev_basal, prev_bolus
             prev_basal, prev_bolus = basal, bolus
 
-            # ---------------- ENV STEP ----------------
             obs = env.step(PatientAction(basal, bolus), cho=0.0)
             done = obs.done
             next_cgm = float(obs.observation.CGM)
-            next_delta = next_cgm - current_cgm  # ← delta for next state
+            next_delta = next_cgm - current_cgm
 
-            # ---------------- REWARD ----------------
             if done and next_cgm < 40.0:
                 reward = -1000.0
                 done = True
             else:
-                reward = glucose_reward(next_cgm, next_delta)  # cgm + trend
-                reward -= 0.01 * abs(next_delta)  # penalize large swings
-                reward -= 0.01 * (abs(basal - old_basal) + abs(bolus - old_bolus))  # smoothness
+                reward = glucose_reward(next_cgm, next_delta)
+                reward -= 0.01 * abs(next_delta)
+                reward -= 0.01 * (abs(basal - old_basal) + abs(bolus - old_bolus))
 
             total_reward += reward
 
