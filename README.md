@@ -4,8 +4,9 @@ Using the simglucose Simulator https://github.com/jxx123/simglucose, trying to p
 DONE: 
 - Coded full TD3 DDPG agent (twin critic delayed). Changed from 
 initial simple DDPG architecture, because training was too unstable.
-- Tested on multiple meal scenarios on patient 'adult_001', agent takes
-about 2500 episodes to converge to a policy it considers optimal... complete
+- Trained on patient `adult#001` with fixed meal scenarios, agent converges after ~2500 episodes
+-Tested multiple reward functions, current one - Reward: time-in-range (70–180 mg/dL) 
+with penalties for large swings and huge negative rewards for severe hypoglycemia.
 
 TO DO : 
 
@@ -13,6 +14,8 @@ TO DO :
 - Implement SAC (soft actor-critic) and test convergence speed and 
 resulting policies.
 - Reconsider state space encoding. Maybe not the best one we've chosen.
+State: CGM, glucose trend, IOB, meal history, previous actions (7 features).
+
 
 EVENTUALLY : 
 
