@@ -15,7 +15,7 @@ TO DO :
 resulting policies.
 - Reconsider state space encoding. Maybe not the best one we've chosen.
 State: CGM, glucose trend, IOB, meal history, previous actions (7 features).
-
+- Tune hyperparameters with Pytorch Raytune.
 
 EVENTUALLY : 
 

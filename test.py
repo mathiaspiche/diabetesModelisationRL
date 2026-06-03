@@ -15,7 +15,7 @@ from reinforcementDIabetes import RecurrentTD3Agent
 # Config
 # ---------------------------------------------------------------------------
 
-LOAD_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation/best"
+LOAD_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\checkpoint_1500"
 RESULTS_PATH = "test_results.txt"
 
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
@@ -70,8 +70,8 @@ def build_state(cgm, prev_cgm, prev_prev_cgm, iob, prev_basal, prev_bolus, meal_
     delta2_norm = delta2 / 50.0
     iob_norm = min(iob, 3.0) / 3.0
     meal_sum = sum(list(meal_history)[-36:]) / 100.0
-    basal_norm = prev_basal / 1.5
-    bolus_norm = prev_bolus / 5.0
+    basal_norm = prev_basal / 0.75   # ← match training
+    bolus_norm = prev_bolus / 3.0    # ← match training
     return np.array(
         [cgm_norm, delta_norm, delta2_norm, iob_norm, meal_sum, basal_norm, bolus_norm],
         dtype=np.float32
@@ -100,12 +100,21 @@ def glucose_reward(cgm, delta):
 # Load actor
 # ---------------------------------------------------------------------------
 
-max_action = torch.tensor([1.5, 5.0], dtype=torch.float32).to(device)
+max_action = torch.tensor([0.75, 3.0], dtype=torch.float32).to(device)
 agent = RecurrentTD3Agent(state_dim=STATE_DIM, action_dim=ACTION_DIM, seq_len=SEQ_LEN)
 agent.load(LOAD_PATH)
 agent.actor.eval()
-print(f"Actor loaded from {LOAD_PATH}")
+test_input = torch.zeros(1, SEQ_LEN, STATE_DIM).to(device)
+x = test_input[:, -1, :]  # what forward() does
+print(f"Input: {x}")
 
+# Manual forward pass layer by layer
+for i, layer in enumerate(agent.actor.net):
+    x = layer(x)
+    print(f"After layer {i} ({layer.__class__.__name__}): mean={x.mean():.4f}, min={x.min():.4f}, max={x.max():.4f}")
+
+print(f"max_action: {agent.actor.max_action}")
+print(f"Final * max_action: {x * agent.actor.max_action}")
 # ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
@@ -122,7 +131,7 @@ step = 0
 done = False
 total_reward = 0.0
 
-cgm_history = deque(maxlen=3)
+cgm_history = deque(maxlen=13)
 meal_history = deque(maxlen=72)
 state_buffer = deque(maxlen=SEQ_LEN)
 
@@ -170,18 +179,15 @@ while step < MAX_STEPS and not done:
     state_buffer.append(state)
     state_seq = np.array(state_buffer, dtype=np.float32)
 
-    # ---- Deterministic action (no noise) ----
     with torch.no_grad():
         state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
         action = agent.actor(state_t).detach().cpu().numpy()[0]
 
-    # Clip to valid physiological range
-    action = np.clip(action, [0.0, 0.0], [1.5, 5.0])
+    action = np.clip(action, [0.0, 0.0], [1.5, 3.0])
     basal, bolus = float(action[0]), float(action[1])
 
     prev_basal, prev_bolus = basal, bolus
 
-    # ---- Environment step ----
     obs = env.step(PatientAction(basal, bolus), cho=0.0)
     done = obs.done
     next_cgm = float(obs.observation.CGM)
@@ -204,9 +210,6 @@ while step < MAX_STEPS and not done:
 
     print(f"{step:>5}  {current_cgm:>7.1f}  {delta:>+6.1f}  {basal:>6.3f}  {bolus:>6.3f}  {reward:>8.2f}")
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 
 cgm_arr = np.array(cgm_log)
 time_in_range = np.mean((cgm_arr >= 70) & (cgm_arr <= 180)) * 100

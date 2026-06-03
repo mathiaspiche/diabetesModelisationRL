@@ -68,7 +68,7 @@ class Case:
         self.start_time += timedelta(hours=0.5)
 
 if __name__ == "__main__":
-    case = Case("adult#002", "Dexcom", "Insulet",
+    case = Case("adult#001", "Dexcom", "Insulet",
                 [(7, 45), (12, 70), (16, 20), (18, 80), (22, 15)])
 
     simobj = SimObj(

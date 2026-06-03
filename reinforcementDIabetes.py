@@ -87,7 +87,7 @@ class RecurrentTD3Agent:
         self.action_dim = action_dim
         self.seq_len = seq_len
 
-        self.max_action = torch.tensor([1.5, 5.0], dtype=torch.float32).to(device)
+        self.max_action = torch.tensor([0.75, 3.0], dtype=torch.float32).to(device)
         self.min_action = torch.tensor([0.0, 0.0], dtype=torch.float32).to(device)
 
 
@@ -101,11 +101,11 @@ class RecurrentTD3Agent:
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4, weight_decay=1e-4)
 
-        self.replay_buffer = deque(maxlen=200_000)
+        self.replay_buffer = deque(maxlen=500000)
 
-        self.gamma = 0.99
+        self.gamma = 0.995
         self.tau = 0.005
         self.policy_noise = 0.15
         self.noise_clip = 0.4
@@ -216,8 +216,8 @@ def build_state(
 
     meal_sum = sum(list(meal_history)[-36:]) / 100.0
 
-    basal_norm = prev_basal / 1.5
-    bolus_norm = prev_bolus / 5.0
+    basal_norm = prev_basal / 0.75
+    bolus_norm = prev_bolus / 3
 
     return np.array([
         cgm_norm,
@@ -229,21 +229,24 @@ def build_state(
         bolus_norm
     ], dtype=np.float32)
 
-def glucose_reward(cgm, delta):
+
+def glucose_reward(cgm, delta, basal, bolus):
     if 70 <= cgm <= 180:
         reward = 1.0
         if cgm < 90 and delta < -3:
             reward -= 0.3
         if cgm > 160 and delta > 3:
             reward -= 0.3
+
     elif 55 <= cgm < 70:
-        reward = -np.exp((70 - cgm) / 5.0)
+        reward = -np.exp((70 - cgm) / 10.0)
     elif 180 < cgm <= 250:
-        reward = -(cgm - 180) / 70
+        reward = -(cgm - 180) / 140
     elif cgm < 55:
-        reward = -50.0
-    else:
         reward = -5.0
+    else:
+        reward = -1.0
+
     return reward
 
 SAVE_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation"
@@ -264,8 +267,8 @@ if __name__ == "__main__":
 
     agent = RecurrentTD3Agent(state_dim=7, action_dim=2, seq_len=SEQ_LEN)
 
-    explore_noise = np.array([0.08, 0.05])
-    explore_noise_decay = 0.995
+    explore_noise = np.array([0.05, 0.25])
+    explore_noise_decay = 0.99
     explore_noise_min = np.array([0.01, 0.01])
 
     best_reward = -np.inf
@@ -282,7 +285,7 @@ if __name__ == "__main__":
         done = False
         total_reward = 0.0
 
-        cgm_history = deque(maxlen=3)
+        cgm_history = deque(maxlen=13)
         meal_history = deque(maxlen=72)
         state_buffer = deque(maxlen=SEQ_LEN)
 
@@ -324,7 +327,7 @@ if __name__ == "__main__":
             state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
             action = agent.actor(state_t).detach().cpu().numpy()[0]
             noise = np.random.normal(0, explore_noise)
-            action = np.clip(action + noise, [0.0, 0.0], [1.5, 5.0])
+            action = np.clip(action + noise, [0.0, 0.0], [0.75, 3.0])
 
             basal, bolus = float(action[0]), float(action[1])
             old_basal, old_bolus = prev_basal, prev_bolus
@@ -336,12 +339,15 @@ if __name__ == "__main__":
             next_delta = next_cgm - current_cgm
 
             if done and next_cgm < 40.0:
-                reward = -1000.0
-                done = True
+                reward = -100.0
             else:
-                reward = glucose_reward(next_cgm, next_delta)
-                reward -= 0.01 * abs(next_delta)
-                reward -= 0.01 * (abs(basal - old_basal) + abs(bolus - old_bolus))
+                reward = glucose_reward(next_cgm, next_delta, basal, bolus)
+                if len(cgm_history) == 13:
+                    trend_12 = next_cgm - list(cgm_history)[0]
+                    if next_cgm <= 80.0 and trend_12 < 0:
+                        reward -= 0.5 * abs(trend_12) / 30.0
+                    elif next_cgm >= 140 and trend_12 > 0:
+                        reward -= 0.5 * trend_12 / 30.0
 
             total_reward += reward
 
@@ -371,8 +377,6 @@ if __name__ == "__main__":
                 )
 
         explore_noise = np.maximum(explore_noise_min, explore_noise * explore_noise_decay)
-        if (episode + 1) % 200 == 0:
-            agent.replay_buffer.clear()
         print(f"Episode {episode+1}: reward={total_reward:.2f}, nb_steps : {step}")
 
         with open(log_path, "a") as f:
