@@ -10,7 +10,7 @@ with penalties for large swings and huge negative rewards for severe hypoglycemi
 
 TO DO : 
 
-- Solve problem with test file, actor always ouputs 0 
+- Solve problems with test file, actor always ouputs 0 
 - Comment code files.
 - Implement SAC (soft actor-critic) and test convergence speed and 
 resulting policies.

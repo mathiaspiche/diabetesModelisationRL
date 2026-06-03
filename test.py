@@ -162,7 +162,6 @@ while step < MAX_STEPS and not done:
     basal, bolus = float(action[0]), float(action[1])
 
     prev_basal, prev_bolus = basal, bolus
-
     obs = env.step(PatientAction(basal, bolus), cho=0.0)
     done = obs.done
     next_cgm = float(obs.observation.CGM)
