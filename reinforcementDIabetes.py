@@ -34,14 +34,14 @@ class Actor(nn.Module):
             nn.ReLU(),
 
             nn.Linear(128, action_dim),
-            nn.Sigmoid()
+            nn.Tanh()
         )
 
     def forward(self, x):
         if x.dim() == 3:
             x = x[:, -1, :]
 
-        action = self.net(x)
+        action = (self.net(x) + 1.0) / 2.0
         return action * self.max_action
 
 
@@ -229,21 +229,19 @@ def build_state(
         bolus_norm
     ], dtype=np.float32)
 
-
-def glucose_reward(cgm, delta, basal, bolus):
+def glucose_reward(cgm, delta):
     if 70 <= cgm <= 180:
         reward = 1.0
         if cgm < 90 and delta < -3:
-            reward -= 0.3
+            reward -= 0.15
         if cgm > 160 and delta > 3:
-            reward -= 0.3
-
+            reward -= 0.15
     elif 55 <= cgm < 70:
-        reward = -np.exp((70 - cgm) / 10.0)
+        reward = -np.exp((70 - cgm) / 10.0)  # softer curve, was /5
     elif 180 < cgm <= 250:
-        reward = -(cgm - 180) / 140
+        reward = -(cgm - 180) / 140        # softer, was /70
     elif cgm < 55:
-        reward = -5.0
+        reward = -10.0                       # was -5.0
     else:
         reward = -1.0
 
@@ -265,10 +263,11 @@ if __name__ == "__main__":
 
     env = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
 
-    agent = RecurrentTD3Agent(state_dim=7, action_dim=2, seq_len=SEQ_LEN)
+    STATE_DIM = 7
+    agent = RecurrentTD3Agent(state_dim=STATE_DIM, action_dim=2, seq_len=SEQ_LEN)
 
-    explore_noise = np.array([0.05, 0.25])
-    explore_noise_decay = 0.99
+    explore_noise = np.array([0.1, 0.3])
+    explore_noise_decay = 0.997
     explore_noise_min = np.array([0.01, 0.01])
 
     best_reward = -np.inf
@@ -328,9 +327,9 @@ if __name__ == "__main__":
             action = agent.actor(state_t).detach().cpu().numpy()[0]
             noise = np.random.normal(0, explore_noise)
             action = np.clip(action + noise, [0.0, 0.0], [0.75, 3.0])
-
+            if current_cgm < 100:
+                action[1] = 0.0
             basal, bolus = float(action[0]), float(action[1])
-            old_basal, old_bolus = prev_basal, prev_bolus
             prev_basal, prev_bolus = basal, bolus
 
             obs = env.step(PatientAction(basal, bolus), cho=0.0)
@@ -338,16 +337,19 @@ if __name__ == "__main__":
             next_cgm = float(obs.observation.CGM)
             next_delta = next_cgm - current_cgm
 
+
             if done and next_cgm < 40.0:
                 reward = -100.0
+                done = True
             else:
-                reward = glucose_reward(next_cgm, next_delta, basal, bolus)
+                reward = glucose_reward(next_cgm, next_delta)
                 if len(cgm_history) == 13:
                     trend_12 = next_cgm - list(cgm_history)[0]
-                    if next_cgm <= 80.0 and trend_12 < 0:
-                        reward -= 0.5 * abs(trend_12) / 30.0
-                    elif next_cgm >= 140 and trend_12 > 0:
-                        reward -= 0.5 * trend_12 / 30.0
+                    target = 112.0
+                    if next_cgm <= 80.0 :
+                        reward -= 0.5 * max(0, -trend_12) / 30.0  # penalize falling trend
+                    elif next_cgm >= 140 :
+                        reward -= 0.5 * min(0, trend_12) / 30.0  # penalize falling trend
 
             total_reward += reward
 
@@ -369,12 +371,16 @@ if __name__ == "__main__":
 
             step += 1
 
-            if episode % 50 == 0:
+            if episode % 10 == 0:
                 print(
                     f"[{step}] CGM={current_cgm:.1f} delta={delta:+.1f} "
                     f"basal={basal:.3f} bolus={bolus:.3f} "
                     f"reward={reward:.2f}"
                 )
+                with torch.no_grad():
+                    test_s = torch.zeros(1, SEQ_LEN, STATE_DIM).to(device)
+                    raw = agent.actor(test_s)
+                    print(f"Actor output sanity: {raw}")
 
         explore_noise = np.maximum(explore_noise_min, explore_noise * explore_noise_decay)
         print(f"Episode {episode+1}: reward={total_reward:.2f}, nb_steps : {step}")

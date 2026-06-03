@@ -15,7 +15,7 @@ from reinforcementDIabetes import RecurrentTD3Agent
 # Config
 # ---------------------------------------------------------------------------
 
-LOAD_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\checkpoint_1500"
+LOAD_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\checkpoint_2000"
 RESULTS_PATH = "test_results.txt"
 
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
@@ -28,33 +28,6 @@ meal_scenario = [(1, 45), (6, 70), (10, 20), (12, 80)]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
-
-# ---------------------------------------------------------------------------
-# Networks  (must match training definition exactly)
-# ---------------------------------------------------------------------------
-
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
-        super().__init__()
-        self.max_action = max_action
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, action_dim),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        if x.dim() == 3:
-            x = x[:, -1, :]
-        return self.net(x) * self.max_action
-
-
-# ---------------------------------------------------------------------------
-# Helpers  (identical to training script)
-# ---------------------------------------------------------------------------
 
 def get_iob(patient) -> float:
     s1 = float(patient.state[10])
@@ -103,7 +76,8 @@ def glucose_reward(cgm, delta):
 max_action = torch.tensor([0.75, 3.0], dtype=torch.float32).to(device)
 agent = RecurrentTD3Agent(state_dim=STATE_DIM, action_dim=ACTION_DIM, seq_len=SEQ_LEN)
 agent.load(LOAD_PATH)
-agent.actor.eval()
+for name, param in agent.actor.named_parameters():
+    print(f"{name}: mean={param.data.mean():.4f}, std={param.data.std():.4f}")
 test_input = torch.zeros(1, SEQ_LEN, STATE_DIM).to(device)
 x = test_input[:, -1, :]  # what forward() does
 print(f"Input: {x}")
@@ -115,9 +89,6 @@ for i, layer in enumerate(agent.actor.net):
 
 print(f"max_action: {agent.actor.max_action}")
 print(f"Final * max_action: {x * agent.actor.max_action}")
-# ---------------------------------------------------------------------------
-# Evaluation loop
-# ---------------------------------------------------------------------------
 
 patient = T1DPatient.withName("adult#001")
 sensor = CGMSensor.withName("Dexcom")
@@ -138,12 +109,11 @@ state_buffer = deque(maxlen=SEQ_LEN)
 prev_basal = 0.0
 prev_bolus = 0.0
 
-# Pre-fill state buffer with zeros
 init_state = np.zeros(STATE_DIM, dtype=np.float32)
 for _ in range(SEQ_LEN):
     state_buffer.append(init_state)
 
-# Stats tracking
+
 cgm_log = []
 basal_log = []
 bolus_log = []
@@ -158,32 +128,37 @@ while step < MAX_STEPS and not done:
     cgm_history.append(current_cgm)
     meal_history.append(float(obs.info['meal']))
 
-    # Need at least 3 CGM readings for trend features
-    if len(cgm_history) < 3:
-        obs = env.step(PatientAction(0.0, 0.0), cho=0.0)
-        step += 1
-        continue
-
     cgm_list = list(cgm_history)
-    delta = current_cgm - cgm_list[-2]
+
+    prev_cgm = cgm_list[-2] if len(cgm_list) >= 2 else current_cgm
+    prev_prev_cgm = cgm_list[-3] if len(cgm_list) >= 3 else current_cgm
+    delta = current_cgm - prev_cgm
 
     state = build_state(
         cgm=current_cgm,
-        prev_cgm=cgm_list[-2],
-        prev_prev_cgm=cgm_list[-3],
+        prev_cgm=prev_cgm,
+        prev_prev_cgm=prev_prev_cgm,
         iob=get_iob(env.patient),
         prev_basal=prev_basal,
         prev_bolus=prev_bolus,
         meal_history=meal_history
     )
+
     state_buffer.append(state)
     state_seq = np.array(state_buffer, dtype=np.float32)
 
     with torch.no_grad():
         state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
-        action = agent.actor(state_t).detach().cpu().numpy()[0]
-
-    action = np.clip(action, [0.0, 0.0], [1.5, 3.0])
+        print(f"state_seq sample: {state_seq[-1]}")
+        print(f"state_seq all zeros: {(state_seq == 0).all()}")
+        raw = agent.actor(state_t)
+        print(f"raw actor output: {raw}")
+        action = raw.detach().cpu().numpy()[0]
+        print(f"action before clip: {action}")
+        print(type(agent.actor.max_action))
+        print(agent.actor.max_action)
+        print(agent.actor.max_action.device)
+    action = np.clip(action, [0.0, 0.0], [0.75, 3.0])
     basal, bolus = float(action[0]), float(action[1])
 
     prev_basal, prev_bolus = basal, bolus
@@ -193,7 +168,6 @@ while step < MAX_STEPS and not done:
     next_cgm = float(obs.observation.CGM)
     next_delta = next_cgm - current_cgm
 
-    # ---- Reward ----
     if done and next_cgm < 40.0:
         reward = -1000.0
     else:
