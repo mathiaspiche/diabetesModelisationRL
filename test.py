@@ -10,7 +10,7 @@ from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
 from simglucose.patient.t1dpatient import T1DPatient
 from myenv import CustomT1DSimEnv, PatientAction
-from reinforcementDIabetes import RecurrentTD3Agent
+from TD3DDPGagent import TD3BasalAgent
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
