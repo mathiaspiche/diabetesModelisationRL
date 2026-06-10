@@ -7,7 +7,6 @@ from collections import deque
 import numpy as np
 from datetime import datetime
 from simglucose.controller.basal_bolus_ctrller import BBController
-
 from simglucose.simulation.scenario import CustomScenario
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
@@ -18,36 +17,55 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
+SAVE_PATH  = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation"
+STATE_DIM  = 6
+SEQ_LEN    = 12
+MAX_STEPS  = 480
+MAX_BASAL  = 0.75
+MAX_BOLUS  = 3.0
 
+MEAL_SCENARIOS = [
+    [(1, 45), (6, 70), (10, 20), (12, 80)],          # original
+    [(2, 60), (7, 80), (12, 50)],                      # 3 meals, heavier
+    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],  # 5 small meals
+    [(3, 90), (11, 70)],                               # 2 large meals
+    [(1, 20), (6, 50), (12, 100)],                     # big dinner
+    [(8, 80), (14, 60)],                               # late start
+    [],                                                 # no meals (fasting)
+    [(1, 45), (6, 70)],                                # only morning
+]
+# ── Networks ──────────────────────────────────────────────────────────────────
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, max_basal=0.75):
+    def __init__(self, state_dim):
         super().__init__()
-        self.max_basal = max_basal
         self.net = nn.Sequential(
             nn.Linear(state_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(256, 256),       nn.ReLU(),
+            nn.Linear(256, 128),       nn.ReLU(),
+            nn.Linear(128, 2),
         )
         nn.init.uniform_(self.net[-1].weight, -0.003, 0.003)
-        # start outputting ~0.2 U/hr basal
-        nn.init.constant_(self.net[-1].bias, math.atanh(0.2 / max_basal))
+        # both outputs start near 0
+        nn.init.constant_(self.net[-1].bias, -6.0)
 
     def forward(self, x):
         if x.dim() == 3:
             x = x[:, -1, :]
-        return torch.tanh(self.net(x)) * self.max_basal
+        out   = self.net(x)
+        basal = torch.sigmoid(out[:, 0:1]) * MAX_BASAL   # [0, 0.75]
+        bolus = torch.sigmoid(out[:, 1:2]) * MAX_BOLUS   # [0, 3.0]
+        return torch.cat([basal, bolus], dim=1)           # (B, 2)
 
 
 class Critic(nn.Module):
     def __init__(self, state_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim + 1, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(state_dim + 2, 256), nn.ReLU(),
+            nn.Linear(256, 256),           nn.ReLU(),
+            nn.Linear(256, 128),           nn.ReLU(),
+            nn.Linear(128, 1),
         )
 
     def forward(self, x, action):
@@ -69,39 +87,45 @@ class DoubleCritic(nn.Module):
         return self.q1(x, action)
 
 
-class TD3BasalAgent:
-    def __init__(self, state_dim, seq_len=12):
-        self.state_dim = state_dim
-        self.seq_len   = seq_len
-        self.max_basal = 0.75
+# ── Agent ─────────────────────────────────────────────────────────────────────
 
-        self.actor         = Actor(state_dim, self.max_basal).to(device)
-        self.actor_target  = Actor(state_dim, self.max_basal).to(device)
-        self.critic        = DoubleCritic(state_dim).to(device)
-        self.critic_target = DoubleCritic(state_dim).to(device)
+class TD3Agent:
+    def __init__(self, state_dim):
+        self.actor          = Actor(state_dim).to(device)
+        self.actor_target   = Actor(state_dim).to(device)
+        self.critic         = DoubleCritic(state_dim).to(device)
+        self.critic_target  = DoubleCritic(state_dim).to(device)
 
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.actor_optimizer  = torch.optim.Adam(self.actor.parameters(),  lr=2e-4)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4, weight_decay=1e-4)
+        self.actor_optimizer  = torch.optim.Adam(self.actor.parameters(),  lr=1e-4)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4,
+                                                  weight_decay=1e-4)
 
-        self.replay_buffer = deque(maxlen=500000)
+        self.replay_buffer = deque(maxlen=500_000)
 
         self.gamma        = 0.97
         self.tau          = 0.005
-        self.policy_noise = 0.05   # smaller since action range is [0, 0.75]
+        self.policy_noise = 0.05
         self.noise_clip   = 0.15
         self.policy_delay = 2
         self.total_it     = 0
 
-    def select_action(self, state_seq):
-        state_t = torch.tensor(state_seq).unsqueeze(0).to(device)
-        with torch.no_grad():
-            return self.actor(state_t).cpu().numpy()[0, 0]
+    # ── action ────────────────────────────────────────────────────────────────
 
-    def store_transition(self, state_seq, basal, reward, next_state_seq, done):
-        self.replay_buffer.append((state_seq, basal, reward, next_state_seq, done))
+    def select_action(self, state_seq):
+        state_t = torch.tensor(state_seq, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            action = self.actor(state_t).cpu().numpy()[0]   # shape (2,)
+        return float(action[0]), float(action[1])           # basal, bolus
+
+    # ── buffer ────────────────────────────────────────────────────────────────
+
+    def store_transition(self, state_seq, basal, bolus, reward, next_state_seq, done):
+        self.replay_buffer.append((state_seq, basal, bolus, reward, next_state_seq, done))
+
+    # ── training step ─────────────────────────────────────────────────────────
 
     def train(self, batch_size=128):
         if len(self.replay_buffer) < batch_size:
@@ -109,36 +133,44 @@ class TD3BasalAgent:
 
         self.total_it += 1
         batch = random.sample(self.replay_buffer, batch_size)
-        state_seq, basals, rewards, next_state_seq, dones = zip(*batch)
+        state_seqs, basals, boluses, rewards, next_state_seqs, dones = zip(*batch)
 
-        state_seq      = torch.tensor(np.array(state_seq),      dtype=torch.float32).to(device)
-        next_state_seq = torch.tensor(np.array(next_state_seq), dtype=torch.float32).to(device)
-        basals         = torch.tensor(basals,  dtype=torch.float32).unsqueeze(1).to(device)
-        rewards        = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(device)
-        dones          = torch.tensor(dones,   dtype=torch.float32).unsqueeze(1).to(device)
+        states      = torch.tensor(np.array(state_seqs),      dtype=torch.float32).to(device)
+        next_states = torch.tensor(np.array(next_state_seqs), dtype=torch.float32).to(device)
+        basals_t    = torch.tensor(np.array(basals),  dtype=torch.float32).unsqueeze(1).to(device)
+        boluses_t   = torch.tensor(np.array(boluses), dtype=torch.float32).unsqueeze(1).to(device)
+        actions     = torch.cat([basals_t, boluses_t], dim=1)   # (B, 2)
+        rewards_t   = torch.tensor(np.array(rewards), dtype=torch.float32).unsqueeze(1).to(device)
+        dones_t     = torch.tensor(np.array(dones),   dtype=torch.float32).unsqueeze(1).to(device)
 
+        # ── critic update ─────────────────────────────────────────────────────
         with torch.no_grad():
-            noise        = (torch.randn_like(basals) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
-            next_actions = (self.actor_target(next_state_seq) + noise).clamp(0.0, self.max_basal)
-            q1_t, q2_t  = self.critic_target(next_state_seq, next_actions)
-            q_target     = rewards + self.gamma * (1 - dones) * torch.min(q1_t, q2_t)
+            noise        = (torch.randn(batch_size, 2) * self.policy_noise) \
+                               .clamp(-self.noise_clip, self.noise_clip).to(device)
+            next_actions = (self.actor_target(next_states) + noise)
+            next_actions[:, 0] = next_actions[:, 0].clamp(0.0, MAX_BASAL)
+            next_actions[:, 1] = next_actions[:, 1].clamp(0.0, MAX_BOLUS)
 
-        q1, q2      = self.critic(state_seq, basals)
+            q1_t, q2_t = self.critic_target(next_states, next_actions)
+            q_target    = rewards_t + self.gamma * (1 - dones_t) * torch.min(q1_t, q2_t)
+
+        q1, q2      = self.critic(states, actions)
         critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
+        # ── actor update (delayed) ────────────────────────────────────────────
         actor_loss_val = None
         if self.total_it % self.policy_delay == 0:
-            actor_loss = -self.critic.q1_only(state_seq, self.actor(state_seq)).mean()
+            actor_loss = -self.critic.q1_only(states, self.actor(states)).mean()
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
-            self._soft_update(self.actor, self.actor_target)
+            self._soft_update(self.actor,  self.actor_target)
             self._soft_update(self.critic, self.critic_target)
             actor_loss_val = actor_loss.item()
 
@@ -162,6 +194,8 @@ class TD3BasalAgent:
         print(f"Loaded ← {path}")
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def get_iob(patient):
     return (float(patient.state[10]) + float(patient.state[11])) / 2000.0
 
@@ -175,66 +209,71 @@ def build_state(cgm, prev_cgm, prev_prev_cgm, iob, prev_basal, meal_history):
         delta2 / 50.0,
         min(iob, 3.0) / 3.0,
         sum(list(meal_history)[-36:]) / 100.0,
-        prev_basal / 0.75,
+        prev_basal / MAX_BASAL,
     ], dtype=np.float32)
 
 
-def glucose_reward(cgm, delta, basal, iob):
-    # dense distance-based reward
-    target   = 110.0
-    distance = abs(cgm - target)
-    reward   = -distance / 150.0       # always in [-2.0, 0]
+def glucose_reward(cgm, prev_cgm=None, basal=0.0, bolus=0.0, meal = 0.0, step = 0):
+    if prev_cgm is None:
+        return 0.0
+    trend = cgm - prev_cgm
+    reward = 0
+    if trend < -0.5:
+        if cgm <= 70:
+            reward -= bolus * 5 + basal * 5
+        elif cgm <= 180 and meal == 0.0:
+            reward += bolus * trend * (cgm - 125) / 55
+        elif cgm <= 240:
+            reward += bolus * 1.5
+        else: 
+            reward += bolus * 2.6
 
-    # hard zone penalties
-    if cgm < 70:
-        reward -= 3.0
-    if cgm < 55:
-        reward -= 8.0
-    if cgm > 250:
+    elif trend > 3:
+        if cgm <= 70:
+            reward -= bolus * 4 + basal * 2
+        elif cgm <= 180 and meal == 0.0:
+            reward += bolus * (trend / 10) * (cgm - 125) / 55
+        elif cgm <= 240:
+            reward += bolus * 2
+        else:
+            reward += bolus * 4
+    if 70 <= cgm <= 180:
+        reward += 1.0
+    elif 180 < cgm <= 240:
+        reward -= 0.5
+    elif cgm > 240:
         reward -= 2.0
-    elif cgm > 180:
-        reward -= (cgm - 180) / 140.0
+    elif cgm < 70:
+        reward -= 3.
+    if step > 300 and 70 <= cgm <= 180 :
+        reward += 4
+    if step >= 400 and 70 <= cgm <= 180:
+        reward += 5
+    if meal == 0.0 and bolus > 0.1 and cgm < 180:
+        reward -= bolus * 3.0
 
-    # penalize giving insulin when already low or falling fast
-    if cgm < 100 and basal > 0:
-        reward -= basal * 2.0
-    if cgm < 80 and basal > 0:
-        reward -= basal * 4.0
-
-    # penalize high IOB stacking when not needed
-    if iob > 1.5 and cgm < 130:
-        reward -= 0.3 * (iob - 1.5)
-
+    if cgm == 39.0 :
+        reward -= 10 * bolus + 20 * basal
     return reward
-
-
-def fixed_bolus(cgm, delta, iob):
-    """Simple rule-based bolus — not learned."""
-    if cgm > 160 and delta >= 0 and iob < 0.8:
-        return float(np.clip((cgm - 150) / 80.0, 0.0, 2.0))
-    return 0.0
-
-
-def run_prefill_episode_bb():
-    """Run one episode with BBController and store transitions."""
+def run_episode(explore_noise, episode_num, total_steps):
+    meal_scenario = random.choice(MEAL_SCENARIOS)
+    scenario = CustomScenario(start_time=START_TIME, scenario=meal_scenario)
+    env.scenario = scenario
     obs = env.reset()
 
-    # BBController needs patient name to look up basal rates
-    controller = BBController(target=140)  # target glucose mg/dL
-
-    cgm_history = deque(maxlen=13)
+    cgm_history  = deque(maxlen=13)
     meal_history = deque(maxlen=72)
     state_buffer = deque(maxlen=SEQ_LEN)
-    prev_basal = 0.0
+    prev_basal   = 0.0
     total_reward = 0.0
-    step = 0
-    done = False
+    step         = 0
+    done         = False
+    episode_log  = []
 
     for _ in range(SEQ_LEN):
         state_buffer.append(np.zeros(STATE_DIM, dtype=np.float32))
 
     while step < MAX_STEPS and not done:
-
         current_cgm = float(obs.observation.CGM)
         cgm_history.append(current_cgm)
         meal_history.append(float(obs.info['meal']))
@@ -242,188 +281,91 @@ def run_prefill_episode_bb():
         if len(cgm_history) < 3:
             obs = env.step(PatientAction(0.0, 0.0), cho=0.0)
             step += 1
+            total_steps += 1
             continue
 
         cgm_list = list(cgm_history)
-        iob = get_iob(env.patient)
+        iob      = get_iob(env.patient)
 
         state = build_state(current_cgm, cgm_list[-2], cgm_list[-3],
                             iob, prev_basal, meal_history)
         state_buffer.append(state)
         state_seq = np.array(state_buffer, dtype=np.float32)
 
-        # ask BBController what to do
-        bb_action = controller.policy(
-            obs.observation,
-            obs.reward,
-            obs.done,
-            patient_name="adult#001",
-            meal=obs.info['meal']
-        )
-        basal = float(np.clip(bb_action.basal, 0.0, 0.75))
-        # ignore BBController bolus — keep fixed rule bolus
-        bolus = fixed_bolus(current_cgm, current_cgm - cgm_list[-2], iob)
+        basal, bolus = agent.select_action(state_seq)
+        basal = float(np.clip(basal + np.random.normal(0, explore_noise * 0.3), 0.0, MAX_BASAL))
+        bolus = float(np.clip(bolus + np.random.normal(0, explore_noise), 0.0, MAX_BOLUS))
 
         prev_basal = basal
 
-        obs = env.step(PatientAction(basal, bolus), cho=0.0)
-        done = obs.done
+        obs      = env.step(PatientAction(basal, bolus), cho=0.0)
+        done     = obs.done
         next_cgm = float(obs.observation.CGM)
-        next_delta = next_cgm - current_cgm
-        cgm_history.append(next_cgm)
+        next_iob = get_iob(env.patient)
 
-        if done and next_cgm < 40.0:
-            reward = -100.0
-        else:
-            reward = glucose_reward(next_cgm, next_delta, basal, get_iob(env.patient))
-
+        reward = -100.0 if (done and next_cgm < 40.0) else \
+            glucose_reward(next_cgm, prev_cgm=current_cgm, basal=basal,
+                           bolus=bolus, meal=float(obs.info['meal']), step=step)
         total_reward += reward
 
         next_state = build_state(next_cgm, current_cgm, cgm_list[-2],
-                                 get_iob(env.patient), basal, meal_history)
+                                 next_iob, basal, meal_history)
         next_state_seq = np.array(list(state_buffer)[1:] + [next_state], dtype=np.float32)
         state_buffer.append(next_state)
 
-        agent.store_transition(state_seq, basal, reward, next_state_seq, done)
+        agent.store_transition(state_seq, basal, bolus, reward, next_state_seq, done)
+
+        if total_steps >= RANDOM_STEPS:
+            agent.train()
+
+        episode_log.append((step, next_cgm, basal, bolus, reward))
         step += 1
+        total_steps += 1
 
-    return total_reward, step
+    if episode_num % 10 == 0:
+        print(f"{'step':>4} {'CGM':>7} {'basal':>7} {'bolus':>7} {'reward':>8}")
+        for s, cgm, b, bo, r in episode_log:
+            print(f"{s:>4} {cgm:>7.1f} {b:>7.3f} {bo:>7.3f} {r:>8.2f}")
+
+    return total_reward, step, total_steps
 
 
-SAVE_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation"
-STATE_DIM  = 6    # removed bolus_norm since bolus is not learned
-SEQ_LEN    = 12
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    RANDOM_STEPS = 10000
+    total_steps = 0
+    patient = T1DPatient.withName("adult#001")
+    sensor = CGMSensor.withName("Dexcom")
+    pump = InsulinPump.withName("Insulet")
+    scenario = CustomScenario(start_time=START_TIME, scenario=MEAL_SCENARIOS[0])
+    env = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
 
-    MAX_STEPS = 480
+    agent = TD3Agent(state_dim=STATE_DIM)
 
-    meal_scenario = [(1, 45), (6, 70), (10, 20), (12, 80)]
-    patient  = T1DPatient.withName("adult#001")
-    sensor   = CGMSensor.withName("Dexcom")
-    pump     = InsulinPump.withName("Insulet")
-    scenario = CustomScenario(start_time=START_TIME, scenario=meal_scenario)
-    env      = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
-
-    agent = TD3BasalAgent(state_dim=STATE_DIM, seq_len=SEQ_LEN)
-
-    explore_noise       = 0.15
-    explore_noise_decay = 0.997
-    explore_noise_min   = 0.01
+    explore_noise = 0.05
+    explore_noise_decay = 0.999
+    explore_noise_min = 0.005
     best_reward         = -np.inf
 
     log_path = "training_log.txt"
     with open(log_path, "w") as f:
-        f.write("TD3 Basal-Only Training Log\n")
-
-    def run_episode(use_rule_based=False):
-        obs = env.reset()
-
-        cgm_history  = deque(maxlen=13)
-        meal_history = deque(maxlen=72)
-        state_buffer = deque(maxlen=SEQ_LEN)
-        prev_basal   = 0.0
-        total_reward = 0.0
-        step         = 0
-        done         = False
-
-        for _ in range(SEQ_LEN):
-            state_buffer.append(np.zeros(STATE_DIM, dtype=np.float32))
-
-        while step < MAX_STEPS and not done:
-
-            current_cgm = float(obs.observation.CGM)
-            cgm_history.append(current_cgm)
-            meal_history.append(float(obs.info['meal']))
-
-            if len(cgm_history) < 3:
-                obs = env.step(PatientAction(0.0, 0.0), cho=0.0)
-                step += 1
-                continue
-
-            cgm_list = list(cgm_history)
-            delta    = current_cgm - cgm_list[-2]
-            iob      = get_iob(env.patient)
-
-            state = build_state(current_cgm, cgm_list[-2], cgm_list[-3],
-                                iob, prev_basal, meal_history)
-            state_buffer.append(state)
-            state_seq = np.array(state_buffer, dtype=np.float32)
-
-            # ── basal selection ───────────────────────────────────────
-            if use_rule_based:
-                basal = float(np.clip((current_cgm - 80) / 200.0, 0.0, 0.75)) \
-                    if current_cgm > 80 else 0.0
-            else:
-                basal = agent.select_action(state_seq)
-                basal += np.random.normal(0, explore_noise)
-                basal  = float(np.clip(basal, 0.0, 0.75))
-
-
-            # ── fixed bolus (rule-based always) ───────────────────────
-            bolus = fixed_bolus(current_cgm, delta, iob)
-
-            prev_basal = basal
-
-            # ── step ──────────────────────────────────────────────────
-            obs        = env.step(PatientAction(basal, bolus), cho=0.0)
-            done       = obs.done
-            next_cgm   = float(obs.observation.CGM)
-            next_delta = next_cgm - current_cgm
-            cgm_history.append(next_cgm)
-
-            # ── reward ────────────────────────────────────────────────
-            if done and next_cgm < 40.0:
-                reward = -100.0
-            else:
-                reward = glucose_reward(next_cgm, next_delta, basal, get_iob(env.patient))
-
-            total_reward += reward
-
-            # ── next state ────────────────────────────────────────────
-            next_state = build_state(next_cgm, current_cgm, cgm_list[-2],
-                                     get_iob(env.patient), basal, meal_history)
-            next_state_seq = np.array(list(state_buffer)[1:] + [next_state], dtype=np.float32)
-            state_buffer.append(next_state)
-
-            agent.store_transition(state_seq, basal, reward, next_state_seq, done)
-
-            if not use_rule_based:
-                agent.train()
-
-            step += 1
-
-        return total_reward, step
-
-    # ── phase 1: prefill ──────────────────────────────────────────────
-    print("Pre-filling buffer with BBController...")
-    for ep in range(50):
-        r, s = run_prefill_episode_bb()
-        print(f"  Prefill {ep + 1}/50 | steps={s} | reward={r:.1f} | buffer={len(agent.replay_buffer)}")
-
-    # ── phase 2: pretrain critic ──────────────────────────────────────
-    print("Pretraining critic...")
-    for _ in range(2000):
-        agent.train()
-    print(f"Done. Buffer: {len(agent.replay_buffer)}")
+        f.write("TD3 Basal+Bolus Training Log\n")
 
     # ── phase 3: RL ───────────────────────────────────────────────────
-    print("Starting RL training (basal only)...")
+    print("Starting RL training (basal + bolus)...")
     for episode in range(2500):
+        r, s, total_steps = run_episode(explore_noise, episode + 1, total_steps)
 
-        r, s = run_episode(use_rule_based=False)
+        if total_steps >= RANDOM_STEPS:
+            explore_noise = max(explore_noise_min, explore_noise * explore_noise_decay)
 
-        explore_noise = max(explore_noise_min, explore_noise * explore_noise_decay)
-        print(f"Episode {episode+1}: reward={r:.2f}, steps={s}, noise={explore_noise:.4f}")
+        print(f"Episode {episode + 1}: reward={r:.2f}, steps={s}, "
+              f"noise={explore_noise:.4f}, total_steps={total_steps}")
+
 
         with open(log_path, "a") as f:
             f.write(f"{episode+1},{r:.2f}\n")
-
-        if r > best_reward:
-            best_reward = r
-            agent.save(SAVE_PATH + "/best")
-            print(f"  New best: {best_reward:.2f}")
 
         if (episode + 1) % 500 == 0:
             agent.save(SAVE_PATH + f"/checkpoint_{episode+1}")
@@ -431,6 +373,8 @@ if __name__ == "__main__":
         if episode % 10 == 0:
             with torch.no_grad():
                 test_s = torch.zeros(1, SEQ_LEN, STATE_DIM).to(device)
-                print(f"  Actor sanity: {agent.actor(test_s).item():.4f} U/hr basal")
+                a = agent.actor(test_s).cpu().numpy()[0]
+                print(f"  Actor sanity: basal={a[0]:.4f} U/hr  bolus={a[1]:.4f} U")
 
     agent.save(SAVE_PATH + "/final")
+    print(f"Training complete. Best reward: {best_reward:.2f}")
