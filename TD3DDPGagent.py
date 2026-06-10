@@ -249,8 +249,6 @@ def glucose_reward(cgm, prev_cgm=None, basal=0.0, bolus=0.0, meal = 0.0, step = 
         reward += 4
     if step >= 400 and 70 <= cgm <= 180:
         reward += 5
-    if meal == 0.0 and bolus > 0.1 and cgm < 180:
-        reward -= bolus * 3.0
     if cgm == 39.0 :
         reward -= 10 * bolus + 20 * basal
     return reward
