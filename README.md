@@ -25,7 +25,7 @@ resulting policies.
         iob (insulin active in body given by simglucose),
         meal_history (past 72 steps (maybe too much)),
         prev_basal (basal injected at last step))
-- Tune hyperparameters with Pytorch Raytune.
+- Tune hyperparameters with Pytorch Raytune
 
 EVENTUALLY : 
 
