@@ -4,22 +4,18 @@ import torch.nn as nn
 import numpy as np
 from collections import deque
 from datetime import datetime
-from simglucose.controller.basal_bolus_ctrller import BBController
 from simglucose.simulation.scenario import CustomScenario
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
 from simglucose.patient.t1dpatient import T1DPatient
-from myenv import CustomT1DSimEnv, PatientAction
+from envs.myenv import CustomT1DSimEnv, PatientAction
 import torch.nn.functional as F
-from simglucose.simulation.sim_engine import SimObj, sim
-from simglucose.simulation.env import T1DSimEnv as _T1DSimEnv
-from datetime import timedelta
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
-SAVE_PATH  = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation"
+SAVE_PATH  = r"/"
 STATE_DIM  = 16
 SEQ_LEN    = 12
 MAX_STEPS  = 480
@@ -358,7 +354,7 @@ if __name__ == "__main__":
     agent = PPOAgent(state_dim=STATE_DIM)
 
     best_reward  = -np.inf
-    log_path     = "training_log_ppo.txt"
+    log_path     = "../training_log_ppo.txt"
     with open(log_path, "w") as f:
         f.write("PPO Training Log\n")
 

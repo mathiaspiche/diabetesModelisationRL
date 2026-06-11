@@ -1,4 +1,3 @@
-import os
 import torch
 import numpy as np
 from collections import deque
@@ -8,13 +7,13 @@ from simglucose.simulation.scenario import CustomScenario
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
 from simglucose.patient.t1dpatient import T1DPatient
-from myenv import CustomT1DSimEnv, PatientAction
-from TD3DDPGagent import TD3Agent, build_state, glucose_reward, get_iob
+from envs.myenv import CustomT1DSimEnv, PatientAction
+from agents.TD3DDPGagent import TD3Agent, build_state, glucose_reward, get_iob
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LOAD_PATH    = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\final"
-RESULTS_PATH = "test_results.txt"
+LOAD_PATH    = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\agents\checkpoints\checkpoint_500"
+RESULTS_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\test_results.txt"
 START_TIME   = datetime(2018, 1, 1, 6, 0, 0)
 MAX_STEPS    = 480
 SEQ_LEN      = 12
