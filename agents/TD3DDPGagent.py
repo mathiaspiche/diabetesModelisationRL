@@ -25,14 +25,14 @@ MAX_BASAL  = 0.75
 MAX_BOLUS  = 3.0
 
 MEAL_SCENARIOS = [
-    [(1, 45), (6, 70), (10, 20), (12, 80)],          # original
-    [(2, 60), (7, 80), (12, 50)],                      # 3 meals, heavier
-    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],  # 5 small meals
-    [(3, 90), (11, 70)],                               # 2 large meals
-    [(1, 20), (6, 50), (12, 100)],                     # big dinner
-    [(8, 80), (14, 60)],                               # late start
-    [],                                                 # no meals (fasting)
-    [(1, 45), (6, 70)],                                # only morning
+    [(1, 45), (6, 70), (10, 20), (12, 80)],
+    [(2, 60), (7, 80), (12, 50)],
+    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],
+    [(3, 90), (11, 70)],
+    [(1, 20), (6, 50), (12, 100)],
+    [(8, 80), (14, 60)],
+    [],
+    [(1, 45), (6, 70)],
 ]
 
 class Actor(nn.Module):
@@ -45,16 +45,15 @@ class Actor(nn.Module):
             nn.Linear(128, 2),
         )
         nn.init.uniform_(self.net[-1].weight, -0.003, 0.003)
-        # both outputs start near 0
         nn.init.constant_(self.net[-1].bias, -6.0)
 
     def forward(self, x):
         if x.dim() == 3:
             x = x[:, -1, :]
         out   = self.net(x)
-        basal = torch.sigmoid(out[:, 0:1]) * MAX_BASAL   # [0, 0.75]
-        bolus = torch.sigmoid(out[:, 1:2]) * MAX_BOLUS   # [0, 3.0]
-        return torch.cat([basal, bolus], dim=1)           # (B, 2)
+        basal = torch.sigmoid(out[:, 0:1]) * MAX_BASAL
+        bolus = torch.sigmoid(out[:, 1:2]) * MAX_BOLUS
+        return torch.cat([basal, bolus], dim=1)
 
 
 class Critic(nn.Module):
@@ -86,8 +85,6 @@ class DoubleCritic(nn.Module):
         return self.q1(x, action)
 
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
-
 class TD3Agent:
     def __init__(self, state_dim):
         self.actor          = Actor(state_dim).to(device)
@@ -111,20 +108,17 @@ class TD3Agent:
         self.policy_delay = 2
         self.total_it     = 0
 
-    # ── action ────────────────────────────────────────────────────────────────
 
     def select_action(self, state_seq):
         state_t = torch.tensor(state_seq, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
-            action = self.actor(state_t).cpu().numpy()[0]   # shape (2,)
-        return float(action[0]), float(action[1])           # basal, bolus
+            action = self.actor(state_t).cpu().numpy()[0]
+        return float(action[0]), float(action[1])
 
-    # ── buffer ────────────────────────────────────────────────────────────────
 
     def store_transition(self, state_seq, basal, bolus, reward, next_state_seq, done):
         self.replay_buffer.append((state_seq, basal, bolus, reward, next_state_seq, done))
 
-    # ── training step ─────────────────────────────────────────────────────────
 
     def train(self, batch_size=128):
         if len(self.replay_buffer) < batch_size:
@@ -138,11 +132,11 @@ class TD3Agent:
         next_states = torch.tensor(np.array(next_state_seqs), dtype=torch.float32).to(device)
         basals_t    = torch.tensor(np.array(basals),  dtype=torch.float32).unsqueeze(1).to(device)
         boluses_t   = torch.tensor(np.array(boluses), dtype=torch.float32).unsqueeze(1).to(device)
-        actions     = torch.cat([basals_t, boluses_t], dim=1)   # (B, 2)
+        actions     = torch.cat([basals_t, boluses_t], dim=1)
         rewards_t   = torch.tensor(np.array(rewards), dtype=torch.float32).unsqueeze(1).to(device)
         dones_t     = torch.tensor(np.array(dones),   dtype=torch.float32).unsqueeze(1).to(device)
 
-        # ── critic update ─────────────────────────────────────────────────────
+
         with torch.no_grad():
             noise        = (torch.randn(batch_size, 2) * self.policy_noise) \
                                .clamp(-self.noise_clip, self.noise_clip).to(device)
@@ -161,7 +155,6 @@ class TD3Agent:
         nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
-        # ── actor update (delayed) ────────────────────────────────────────────
         actor_loss_val = None
         if self.total_it % self.policy_delay == 0:
             actor_loss = -self.critic.q1_only(states, self.actor(states)).mean()
@@ -192,8 +185,6 @@ class TD3Agent:
         self.critic_target.load_state_dict(self.critic.state_dict())
         print(f"Loaded ← {path}")
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_iob(patient):
     return (float(patient.state[10]) + float(patient.state[11])) / 2000.0
@@ -311,7 +302,6 @@ def run_episode(explore_noise, episode_num, total_steps):
     return total_reward, step, total_steps
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     RANDOM_STEPS = 10000
@@ -333,7 +323,6 @@ if __name__ == "__main__":
     with open(log_path, "w") as f:
         f.write("TD3 Basal+Bolus Training Log\n")
 
-    # ── phase 3: RL ───────────────────────────────────────────────────
     print("Starting RL training (basal + bolus)...")
     for episode in range(2500):
         r, s, total_steps = run_episode(explore_noise, episode + 1, total_steps)
