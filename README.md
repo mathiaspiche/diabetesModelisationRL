@@ -10,9 +10,16 @@ with penalties for large swings and huge negative rewards for severe hypoglycemi
 - Coded PPO agent to compare results to DPPG approach, considering DDPG
 is prone to estimation bias between actor-critic, whereas PPO considers
 its actual policy observation (on-policy).
-- Change considerably reward function, initial weight and biases init, 
+
+
+PROBLEMS :
+
+-Changed considerably reward function, initial weight and biases init, 
 noise injection in actor actions but still, a major problem remains : 
-insulin injection is driven to 0.0. I am trying to fix that.
+insulin injection is driven to 0.0. I am trying to fix that. Fixed with 
+reward function, but agent gives too large of a basal rate at some points
+in time (explicable by an sign error in past reward function) and dosent 
+give bolus at all, even at meals.
 
 TO DO : 
 
