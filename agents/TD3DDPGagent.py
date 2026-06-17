@@ -1,12 +1,10 @@
 import os
-import math
 import torch
 import torch.nn as nn
 import random
 from collections import deque
 import numpy as np
 from datetime import datetime
-from simglucose.controller.basal_bolus_ctrller import BBController
 from simglucose.simulation.scenario import CustomScenario
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
@@ -25,36 +23,38 @@ MAX_BASAL  = 0.75
 MAX_BOLUS  = 3.0
 
 MEAL_SCENARIOS = [
-    [(1, 45), (6, 70), (10, 20), (12, 80)],          # original
-    [(2, 60), (7, 80), (12, 50)],                      # 3 meals, heavier
-    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],  # 5 small meals
-    [(3, 90), (11, 70)],                               # 2 large meals
-    [(1, 20), (6, 50), (12, 100)],                     # big dinner
-    [(8, 80), (14, 60)],                               # late start
-    [],                                                 # no meals (fasting)
-    [(1, 45), (6, 70)],                                # only morning
+    [(1, 45), (6, 70), (10, 20), (12, 80)],
+    [(2, 60), (7, 80), (12, 50)],
+    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],
+    [(3, 90), (11, 70)],
+    [(1, 20), (6, 50), (12, 100)],
+    [(8, 80), (14, 60)],
+    [],
+    [(1, 45), (6, 70)],
 ]
 
 class Actor(nn.Module):
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, hidden=64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256),       nn.ReLU(),
-            nn.Linear(256, 128),       nn.ReLU(),
+        self.lstm = nn.LSTM(state_dim, hidden, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 128), nn.ReLU(),
             nn.Linear(128, 2),
         )
-        nn.init.uniform_(self.net[-1].weight, -0.003, 0.003)
-        # both outputs start near 0
-        nn.init.constant_(self.net[-1].bias, -6.0)
+        nn.init.uniform_(self.head[-1].weight, -0.003, 0.003)
+        with torch.no_grad():
+            self.head[-1].bias[0] = -0.4
+            self.head[-1].bias[1] = -4.0
 
     def forward(self, x):
-        if x.dim() == 3:
-            x = x[:, -1, :]
-        out   = self.net(x)
-        basal = torch.sigmoid(out[:, 0:1]) * MAX_BASAL   # [0, 0.75]
-        bolus = torch.sigmoid(out[:, 1:2]) * MAX_BOLUS   # [0, 3.0]
-        return torch.cat([basal, bolus], dim=1)           # (B, 2)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        out, _ = self.lstm(x)
+        feat   = out[:, -1, :]
+        a      = self.head(feat)
+        basal  = torch.sigmoid(a[:, 0:1]) * MAX_BASAL
+        bolus  = torch.sigmoid(a[:, 1:2]) * MAX_BOLUS
+        return torch.cat([basal, bolus], dim=1)
 
 
 class Critic(nn.Module):
@@ -86,7 +86,6 @@ class DoubleCritic(nn.Module):
         return self.q1(x, action)
 
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
 
 class TD3Agent:
     def __init__(self, state_dim):
@@ -104,27 +103,26 @@ class TD3Agent:
 
         self.replay_buffer = deque(maxlen=500_000)
 
-        self.gamma        = 0.97
+        self.gamma        = 0.98
         self.tau          = 0.005
         self.policy_noise = 0.05
         self.noise_clip   = 0.15
         self.policy_delay = 2
         self.total_it     = 0
 
-    # ── action ────────────────────────────────────────────────────────────────
+
 
     def select_action(self, state_seq):
         state_t = torch.tensor(state_seq, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
-            action = self.actor(state_t).cpu().numpy()[0]   # shape (2,)
-        return float(action[0]), float(action[1])           # basal, bolus
+            action = self.actor(state_t).cpu().numpy()[0]
+        return float(action[0]), float(action[1])
 
-    # ── buffer ────────────────────────────────────────────────────────────────
+
 
     def store_transition(self, state_seq, basal, bolus, reward, next_state_seq, done):
         self.replay_buffer.append((state_seq, basal, bolus, reward, next_state_seq, done))
 
-    # ── training step ─────────────────────────────────────────────────────────
 
     def train(self, batch_size=128):
         if len(self.replay_buffer) < batch_size:
@@ -138,11 +136,11 @@ class TD3Agent:
         next_states = torch.tensor(np.array(next_state_seqs), dtype=torch.float32).to(device)
         basals_t    = torch.tensor(np.array(basals),  dtype=torch.float32).unsqueeze(1).to(device)
         boluses_t   = torch.tensor(np.array(boluses), dtype=torch.float32).unsqueeze(1).to(device)
-        actions     = torch.cat([basals_t, boluses_t], dim=1)   # (B, 2)
+        actions     = torch.cat([basals_t, boluses_t], dim=1)
         rewards_t   = torch.tensor(np.array(rewards), dtype=torch.float32).unsqueeze(1).to(device)
         dones_t     = torch.tensor(np.array(dones),   dtype=torch.float32).unsqueeze(1).to(device)
 
-        # ── critic update ─────────────────────────────────────────────────────
+
         with torch.no_grad():
             noise        = (torch.randn(batch_size, 2) * self.policy_noise) \
                                .clamp(-self.noise_clip, self.noise_clip).to(device)
@@ -161,7 +159,7 @@ class TD3Agent:
         nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
-        # ── actor update (delayed) ────────────────────────────────────────────
+
         actor_loss_val = None
         if self.total_it % self.policy_delay == 0:
             actor_loss = -self.critic.q1_only(states, self.actor(states)).mean()
@@ -193,7 +191,6 @@ class TD3Agent:
         print(f"Loaded ← {path}")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_iob(patient):
     return (float(patient.state[10]) + float(patient.state[11])) / 2000.0
@@ -212,29 +209,13 @@ def build_state(cgm, prev_cgm, prev_prev_cgm, iob, prev_basal, meal_history):
     ], dtype=np.float32)
 
 
-def glucose_reward(cgm, prev_cgm=None, basal=0.0, bolus=0.0, meal = 0.0, step = 0):
-    if prev_cgm is None:
-        return 0.0
-    reward = 0
-    if meal == 0.0 :
-        reward -= bolus * 10
-    else :
-        reward += bolus
-    if bolus <= 0.05 :
-        reward -= bolus * 50
+def glucose_reward(cgm, meal=0.0, bolus=0.0):
+    rew = 0.0
     if 70 <= cgm <= 180:
-        reward += 1.0
-    elif 180 < cgm <= 240:
-        reward -= 0.5
-    elif cgm > 240:
-        reward -= 2.0
-    elif cgm < 70:
-        reward -= 3 - basal
-    if step >= 400 and 70 <= cgm <= 180:
-        reward += 3
-    if cgm == 39.0 :
-        reward -= 10 * bolus + 20 * basal
-    return reward
+        rew += 1.0
+    if meal == 0.0 and bolus > 0.0:
+        rew -= 3*bolus
+    return rew
 def run_episode(explore_noise, episode_num, total_steps):
     meal_scenario = random.choice(MEAL_SCENARIOS)
     scenario = CustomScenario(start_time=START_TIME, scenario=meal_scenario)
@@ -272,11 +253,12 @@ def run_episode(explore_noise, episode_num, total_steps):
                             iob, prev_basal, meal_history)
         state_buffer.append(state)
         state_seq = np.array(state_buffer, dtype=np.float32)
-
         basal, bolus = agent.select_action(state_seq)
         basal = float(np.clip(basal + np.random.normal(0, explore_noise), 0.0, MAX_BASAL))
-        bolus = float(np.clip(bolus + np.random.normal(0, explore_noise * 0.3), 0.0, MAX_BOLUS))
-
+        if meal != 0.0 and np.random.rand() < explore_noise * 2:
+            bolus = float(np.random.uniform(0.0, MAX_BOLUS))
+        else:
+            bolus = float(np.clip(bolus + np.random.normal(0, explore_noise), 0.0, MAX_BOLUS))
         prev_basal = basal
 
         obs      = env.step(PatientAction(basal, bolus), cho=0.0)
@@ -284,9 +266,7 @@ def run_episode(explore_noise, episode_num, total_steps):
         next_cgm = float(obs.observation.CGM)
         next_iob = get_iob(env.patient)
 
-        reward = -100.0 if (done and next_cgm < 40.0) else \
-            glucose_reward(next_cgm, prev_cgm=current_cgm, basal=basal,
-                           bolus=bolus, meal=float(obs.info['meal']), step=step)
+        reward = -obs.info['risk'] / 10.0 + glucose_reward(next_cgm, meal, bolus)
         total_reward += reward
 
         next_state = build_state(next_cgm, current_cgm, cgm_list[-2],
@@ -297,21 +277,25 @@ def run_episode(explore_noise, episode_num, total_steps):
         agent.store_transition(state_seq, basal, bolus, reward, next_state_seq, done)
 
         if total_steps >= RANDOM_STEPS:
-            agent.train()
+            c_loss, a_loss = agent.train()
+            if total_steps % 2000 == 0 and c_loss is not None:
+                print(f"[train] step={total_steps}  critic={c_loss:.4f}  actor={a_loss}  "
+                      f"out_bias={[round(b, 3) for b in agent.actor.head[-1].bias.data.tolist()]}")
+
 
         episode_log.append((step, next_cgm, basal, bolus, reward, meal))
         step += 1
         total_steps += 1
 
+        if done:
+            break
+
     if episode_num % 10 == 0:
         print(f"{'step':>4} {'CGM':>7} {'basal':>7} {'bolus':>7} {'reward':>8} {'meal':>8}")
         for s, cgm, b, bo, r, m in episode_log:
-            print(f"{s:>4} {cgm:>7.1f} {b:>7.3f} {bo:>7.3f} {r:>8.2f} {m : > 8.2f}")
+            print(f"{s:>4} {cgm:>7.1f} {b:>7.3f} {bo:>7.3f} {r:>8.2f} {m:>8.2f}")
 
     return total_reward, step, total_steps
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     RANDOM_STEPS = 10000
@@ -333,7 +317,7 @@ if __name__ == "__main__":
     with open(log_path, "w") as f:
         f.write("TD3 Basal+Bolus Training Log\n")
 
-    # ── phase 3: RL ───────────────────────────────────────────────────
+
     print("Starting RL training (basal + bolus)...")
     for episode in range(2500):
         r, s, total_steps = run_episode(explore_noise, episode + 1, total_steps)

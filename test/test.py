@@ -10,9 +10,8 @@ from simglucose.patient.t1dpatient import T1DPatient
 from envs.myenv import CustomT1DSimEnv, PatientAction
 from agents.TD3DDPGagent import TD3Agent, build_state, glucose_reward, get_iob
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
-LOAD_PATH    = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\agents\checkpoints\checkpoint_500"
+LOAD_PATH    = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\checkpoint_500"
 RESULTS_PATH = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation\test_results.txt"
 START_TIME   = datetime(2018, 1, 1, 6, 0, 0)
 MAX_STEPS    = 480
@@ -26,13 +25,12 @@ meal_scenario = [(1, 45), (6, 70), (10, 20), (12, 80)]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# ── Load agent ────────────────────────────────────────────────────────────────
 
 agent = TD3Agent(state_dim=STATE_DIM)
 agent.load(LOAD_PATH)
+print(agent.actor.state_dict())
 agent.actor.eval()
 
-# ── Environment ───────────────────────────────────────────────────────────────
 
 patient  = T1DPatient.withName("adult#001")
 sensor   = CGMSensor.withName("Dexcom")
@@ -42,7 +40,6 @@ env      = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=s
 
 obs = env.reset()
 
-# ── Episode ───────────────────────────────────────────────────────────────────
 
 cgm_history  = deque(maxlen=13)
 meal_history = deque(maxlen=72)
@@ -89,15 +86,17 @@ while step < MAX_STEPS and not done:
 
     prev_basal = basal
 
-    obs      = env.step(PatientAction(basal, bolus), cho=0.0)
-    done     = obs.done
+    obs = env.step(PatientAction(basal, bolus), cho=0.0)
+    done = obs.done
     next_cgm = float(obs.observation.CGM)
     next_iob = get_iob(env.patient)
-    delta    = next_cgm - current_cgm
+    delta = next_cgm - current_cgm
 
-    reward = -100.0 if (done and next_cgm < 40.0) else \
-        glucose_reward(next_cgm, prev_cgm=current_cgm, basal=basal,
-                       bolus=bolus, meal=meal, step=step)
+    if next_cgm <= 39.0:
+        reward = -100.0
+        done = True
+    else:
+        reward = -obs.info['risk'] / 10.0 + glucose_reward(next_cgm, meal, bolus)
     total_reward += reward
 
     cgm_log.append(next_cgm)
@@ -110,8 +109,6 @@ while step < MAX_STEPS and not done:
           f"{bolus:>6.3f}  {meal:>6.1f}  {reward:>8.2f}")
 
     step += 1
-
-# ── Summary ───────────────────────────────────────────────────────────────────
 
 cgm_arr        = np.array(cgm_log)
 time_in_range  = np.mean((cgm_arr >= 70) & (cgm_arr <= 180)) * 100
