@@ -14,12 +14,11 @@ its actual policy observation (on-policy).
 
 PROBLEMS :
 
--Changed considerably reward function, initial weight and biases init, 
-noise injection in actor actions but still, a major problem remains : 
-insulin injection is driven to 0.0. I am trying to fix that. Fixed with 
-reward function, but agent gives too large of a basal rate at some points
-in time (explicable by an sign error in past reward function) and dosent 
-give bolus at all, even at meals.
+- Agent is able to keep BG in desirable range (72 - 180) during about
+95% of the timesteps for meal scenarios it has been trained on. However, 
+it struggles to do so for new meal scenario. Need to improve its generalization
+capabilities and study possible overfitting to training data. I will try
+to train on bigger variety of meal scenarios (and more episodes).
 
 TO DO : 
 
