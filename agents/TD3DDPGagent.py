@@ -21,16 +21,20 @@ SEQ_LEN    = 12
 MAX_STEPS  = 480
 MAX_BASAL  = 0.75
 MAX_BOLUS  = 3.0
-
+GAMMA = 0.988
 MEAL_SCENARIOS = [
     [(1, 45), (6, 70), (10, 20), (12, 80)],
     [(2, 60), (7, 80), (12, 50)],
     [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],
-    [(3, 90), (11, 70)],
-    [(1, 20), (6, 50), (12, 100)],
-    [(8, 80), (14, 60)],
+    [(3, 90), (16, 100)],
     [],
     [(1, 45), (6, 70)],
+    [(1, 30), (5, 40), (13, 30), (12, 80), (3, 30), (10, 40)],
+    [(0.6, 80), (0.8, 80)],
+    [(1, 38), (2, 41), (3.5, 32), (4.5, 92.1), (10, 30), (12, 40), (15, 40), (18, 31.5), (23, 16.7)],
+    [(10, 47), (22, 101), (12, 80)],
+    [(0.6, 80), (0.8, 80), (12,36)],
+    [(16, 80), (18, 80), (22,36)],
 ]
 
 class Actor(nn.Module):
@@ -103,7 +107,7 @@ class TD3Agent:
 
         self.replay_buffer = deque(maxlen=500_000)
 
-        self.gamma        = 0.98
+        self.gamma        = GAMMA
         self.tau          = 0.005
         self.policy_noise = 0.05
         self.noise_clip   = 0.15
@@ -179,16 +183,36 @@ class TD3Agent:
 
     def save(self, path):
         os.makedirs(path, exist_ok=True)
-        torch.save(self.actor.state_dict(),  f"{path}/actor.pth")
-        torch.save(self.critic.state_dict(), f"{path}/critic.pth")
+        torch.save({
+            'actor':         self.actor.state_dict(),
+            'critic':        self.critic.state_dict(),
+            'actor_target':  self.actor_target.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'actor_opt':     self.actor_optimizer.state_dict(),
+            'critic_opt':    self.critic_optimizer.state_dict(),
+            'total_it':      self.total_it,
+        }, f"{path}/agent.pth")
         print(f"Saved → {path}")
 
     def load(self, path):
-        self.actor.load_state_dict(torch.load(f"{path}/actor.pth",  map_location=device))
-        self.critic.load_state_dict(torch.load(f"{path}/critic.pth", map_location=device))
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        print(f"Loaded ← {path}")
+        ckpt_path = f"{path}/agent.pth"
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            self.actor.load_state_dict(ckpt['actor'])
+            self.critic.load_state_dict(ckpt['critic'])
+            self.actor_target.load_state_dict(ckpt['actor_target'])
+            self.critic_target.load_state_dict(ckpt['critic_target'])
+            self.actor_optimizer.load_state_dict(ckpt['actor_opt'])
+            self.critic_optimizer.load_state_dict(ckpt['critic_opt'])
+            self.total_it = ckpt['total_it']
+            print(f"Loaded (full state) ← {path}")
+        else:
+            # legacy checkpoints: weights only — optimizer & total_it cold-start
+            self.actor.load_state_dict(torch.load(f"{path}/actor.pth",  map_location=device))
+            self.critic.load_state_dict(torch.load(f"{path}/critic.pth", map_location=device))
+            self.actor_target.load_state_dict(self.actor.state_dict())
+            self.critic_target.load_state_dict(self.critic.state_dict())
+            print(f"Loaded (weights only, legacy) ← {path}")
 
 
 
@@ -210,12 +234,11 @@ def build_state(cgm, prev_cgm, prev_prev_cgm, iob, prev_basal, meal_history):
 
 
 def glucose_reward(cgm, meal=0.0, bolus=0.0):
-    rew = 0.0
-    if 70 <= cgm <= 180:
-        rew += 1.0
+    rew = max(0.0, 1.0 - abs(cgm - 120) / 70.0)
     if meal == 0.0 and bolus > 0.0:
-        rew -= 3*bolus
+        rew -= 3 * bolus
     return rew
+
 def run_episode(explore_noise, episode_num, total_steps):
     meal_scenario = random.choice(MEAL_SCENARIOS)
     scenario = CustomScenario(start_time=START_TIME, scenario=meal_scenario)
@@ -266,7 +289,11 @@ def run_episode(explore_noise, episode_num, total_steps):
         next_cgm = float(obs.observation.CGM)
         next_iob = get_iob(env.patient)
 
-        reward = -obs.info['risk'] / 10.0 + glucose_reward(next_cgm, meal, bolus)
+        if next_cgm <= 39.0:
+            reward = (-obs.info['risk'] / 10.0) / (1.0 - GAMMA)
+            done = True
+        else:
+            reward = -obs.info['risk'] / 10.0 + glucose_reward(next_cgm, meal, bolus)
         total_reward += reward
 
         next_state = build_state(next_cgm, current_cgm, cgm_list[-2],
@@ -287,7 +314,7 @@ def run_episode(explore_noise, episode_num, total_steps):
         step += 1
         total_steps += 1
 
-        if done:
+        if done:     
             break
 
     if episode_num % 10 == 0:
@@ -298,7 +325,7 @@ def run_episode(explore_noise, episode_num, total_steps):
     return total_reward, step, total_steps
 
 if __name__ == "__main__":
-    RANDOM_STEPS = 10000
+    RANDOM_STEPS = 12000
     total_steps = 0
     patient = T1DPatient.withName("adult#001")
     sensor = CGMSensor.withName("Dexcom")
@@ -307,8 +334,7 @@ if __name__ == "__main__":
     env = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
 
     agent = TD3Agent(state_dim=STATE_DIM)
-
-    explore_noise = 0.05
+    explore_noise = 0.07
     explore_noise_decay = 0.999
     explore_noise_min = 0.005
     best_reward         = -np.inf
@@ -319,7 +345,8 @@ if __name__ == "__main__":
 
 
     print("Starting RL training (basal + bolus)...")
-    for episode in range(2500):
+    start_ep = 0
+    for episode in range(start_ep, 2500):
         r, s, total_steps = run_episode(explore_noise, episode + 1, total_steps)
 
         if total_steps >= RANDOM_STEPS:
