@@ -10,33 +10,20 @@ from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
 from simglucose.patient.t1dpatient import T1DPatient
 from envs.myenv import CustomT1DSimEnv, PatientAction
+from utils.config_locale import BASE
+from utils.random_meals import random_meal_scenario
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
+print(f"Using device: {device}")
+RISK_LOOKBACK = 5
 START_TIME = datetime(2018, 1, 1, 6, 0, 0)
-SAVE_PATH  = r"C:\Users\mathi\OneDrive\Documents\diabetesModelisation"
 STATE_DIM  = 6
 SEQ_LEN    = 12
 MAX_STEPS  = 480
 MAX_BASAL  = 0.75
 MAX_BOLUS  = 3.0
-GAMMA = 0.988
-MEAL_SCENARIOS = [
-    [(1, 45), (6, 70), (10, 20), (12, 80)],
-    [(2, 60), (7, 80), (12, 50)],
-    [(1, 30), (5, 40), (9, 30), (13, 60), (17, 45)],
-    [(3, 90), (16, 100)],
-    [],
-    [(1, 45), (6, 70)],
-    [(1, 30), (5, 40), (13, 30), (12, 80), (3, 30), (10, 40)],
-    [(0.6, 80), (0.8, 80)],
-    [(1, 38), (2, 41), (3.5, 32), (4.5, 92.1), (10, 30), (12, 40), (15, 40), (18, 31.5), (23, 16.7)],
-    [(10, 47), (22, 101), (12, 80)],
-    [(0.6, 80), (0.8, 80), (12,36)],
-    [(16, 80), (18, 80), (22,36)],
-]
-
+GAMMA = 0.99
 class Actor(nn.Module):
     def __init__(self, state_dim, hidden=64):
         super().__init__()
@@ -62,20 +49,20 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
+
     def __init__(self, state_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + 2, 256), nn.ReLU(),
-            nn.Linear(256, 256),           nn.ReLU(),
-            nn.Linear(256, 128),           nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1),
         )
 
     def forward(self, x, action):
-        if x.dim() == 3:
+        if x.dim() == 3:  # (B, seq, dim) -> last frame
             x = x[:, -1, :]
         return self.net(torch.cat([x, action], dim=1))
-
 
 class DoubleCritic(nn.Module):
     def __init__(self, state_dim):
@@ -101,9 +88,8 @@ class TD3Agent:
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.actor_optimizer  = torch.optim.Adam(self.actor.parameters(),  lr=1e-4)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4,
-                                                  weight_decay=1e-4)
+        self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=1e-4)
+        self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), lr=3e-4)
 
         self.replay_buffer = deque(maxlen=500_000)
 
@@ -181,23 +167,38 @@ class TD3Agent:
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(self.tau * sp.data + (1 - self.tau) * tp.data)
 
-    def save(self, path):
+    def save(self, path, extra=None):
         os.makedirs(path, exist_ok=True)
-        torch.save({
-            'actor':         self.actor.state_dict(),
-            'critic':        self.critic.state_dict(),
-            'actor_target':  self.actor_target.state_dict(),
+        payload = {
+            'state_dim': STATE_DIM,
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
             'critic_target': self.critic_target.state_dict(),
-            'actor_opt':     self.actor_optimizer.state_dict(),
-            'critic_opt':    self.critic_optimizer.state_dict(),
-            'total_it':      self.total_it,
-        }, f"{path}/agent.pth")
-        print(f"Saved → {path}")
+            'actor_opt': self.actor_optimizer.state_dict(),
+            'critic_opt': self.critic_optimizer.state_dict(),
+            'total_it': self.total_it,
+        }
+        if extra:  # [FIX-8] resume state lives here
+            payload.update(extra)
+        torch.save(payload, f"{path}/agent.pth")
+        print(f"Saved -> {path}")
 
     def load(self, path):
+        """Returns a dict of resume state, or {} if nothing/incompatible loaded."""
         ckpt_path = f"{path}/agent.pth"
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device)
+        if not os.path.exists(ckpt_path):
+            print(f"[load] no checkpoint at {path}; starting fresh.")
+            return {}
+
+        ckpt = torch.load(ckpt_path, map_location=device)
+
+        # architecture-compatibility guard
+        if ckpt.get('state_dim') != STATE_DIM:
+            print(f"[load] WARNING: checkpoint state_dim={ckpt.get('state_dim')} "
+                  f"!= current {STATE_DIM}. Architecture changed; starting fresh.")
+            return {}
+        try:
             self.actor.load_state_dict(ckpt['actor'])
             self.critic.load_state_dict(ckpt['critic'])
             self.actor_target.load_state_dict(ckpt['actor_target'])
@@ -205,15 +206,13 @@ class TD3Agent:
             self.actor_optimizer.load_state_dict(ckpt['actor_opt'])
             self.critic_optimizer.load_state_dict(ckpt['critic_opt'])
             self.total_it = ckpt['total_it']
-            print(f"Loaded (full state) ← {path}")
-        else:
-            # legacy checkpoints: weights only — optimizer & total_it cold-start
-            self.actor.load_state_dict(torch.load(f"{path}/actor.pth",  map_location=device))
-            self.critic.load_state_dict(torch.load(f"{path}/critic.pth", map_location=device))
-            self.actor_target.load_state_dict(self.actor.state_dict())
-            self.critic_target.load_state_dict(self.critic.state_dict())
-            print(f"Loaded (weights only, legacy) ← {path}")
+        except (RuntimeError, KeyError) as e:
+            print(f"[load] WARNING: incompatible checkpoint ({e}); starting fresh.")
+            return {}
 
+        print(f"[load] full state restored from {path}")
+        return {k: ckpt[k] for k in ('total_steps', 'explore_noise', 'episode')
+                if k in ckpt}
 
 
 def get_iob(patient):
@@ -233,14 +232,16 @@ def build_state(cgm, prev_cgm, prev_prev_cgm, iob, prev_basal, meal_history):
     ], dtype=np.float32)
 
 
-def glucose_reward(cgm, meal=0.0, bolus=0.0):
+def glucose_reward(cgm, meal=0.0, bolus=0.0, basal=0.0, iob=0.0):
     rew = max(0.0, 1.0 - abs(cgm - 120) / 70.0)
+    if cgm < 80:
+        rew -= (80 - cgm) * 0.05
     if meal == 0.0 and bolus > 0.0:
-        rew -= 3 * bolus
+        rew -= 0.8 * bolus
     return rew
 
 def run_episode(explore_noise, episode_num, total_steps):
-    meal_scenario = random.choice(MEAL_SCENARIOS)
+    meal_scenario = random_meal_scenario()
     scenario = CustomScenario(start_time=START_TIME, scenario=meal_scenario)
     env.scenario = scenario
     obs = env.reset()
@@ -248,12 +249,14 @@ def run_episode(explore_noise, episode_num, total_steps):
     cgm_history  = deque(maxlen=13)
     meal_history = deque(maxlen=72)
     state_buffer = deque(maxlen=SEQ_LEN)
+    risk_window  = deque(maxlen=RISK_LOOKBACK + 1)   # holds r_{t-5} .. r_t
     prev_basal   = 0.0
     total_reward = 0.0
     step         = 0
     done         = False
     episode_log  = []
 
+    # prime the LSTM window with zeros
     for _ in range(SEQ_LEN):
         state_buffer.append(np.zeros(STATE_DIM, dtype=np.float32))
 
@@ -263,6 +266,7 @@ def run_episode(explore_noise, episode_num, total_steps):
         meal = float(obs.info['meal'])
         meal_history.append(meal)
 
+        # warm-up: need a few CGM readings before deltas are valid
         if len(cgm_history) < 3:
             obs = env.step(PatientAction(0.0, 0.0), cho=0.0)
             step += 1
@@ -272,28 +276,41 @@ def run_episode(explore_noise, episode_num, total_steps):
         cgm_list = list(cgm_history)
         iob      = get_iob(env.patient)
 
+        # current state -> push into the rolling window
         state = build_state(current_cgm, cgm_list[-2], cgm_list[-3],
                             iob, prev_basal, meal_history)
         state_buffer.append(state)
         state_seq = np.array(state_buffer, dtype=np.float32)
+
+        # 1) agent selects, then add exploration noise -> REQUESTED action
         basal, bolus = agent.select_action(state_seq)
         basal = float(np.clip(basal + np.random.normal(0, explore_noise), 0.0, MAX_BASAL))
         if meal != 0.0 and np.random.rand() < explore_noise * 2:
             bolus = float(np.random.uniform(0.0, MAX_BOLUS))
         else:
             bolus = float(np.clip(bolus + np.random.normal(0, explore_noise), 0.0, MAX_BOLUS))
-        prev_basal = basal
 
+        # 2) step the env (env applies the low-glucose suspend internally)
         obs      = env.step(PatientAction(basal, bolus), cho=0.0)
         done     = obs.done
         next_cgm = float(obs.observation.CGM)
         next_iob = get_iob(env.patient)
 
+        # 3) overwrite with what the pump ACTUALLY delivered (post-suspend)
+        basal = obs.info.get('delivered_basal', basal)
+        bolus = obs.info.get('delivered_bolus', bolus)
+        prev_basal = basal
+
+        current_risk = float(obs.info['risk'])
+        risk_window.append(current_risk)
+
         if next_cgm <= 39.0:
-            reward = (-obs.info['risk'] / 10.0) / (1.0 - GAMMA)
-            done = True
+            reward = (-current_risk / 10.0) / (1.0 - GAMMA)
+            done   = True
+        elif len(risk_window) == risk_window.maxlen:
+            reward = (risk_window[0] - current_risk) / 10.0
         else:
-            reward = -obs.info['risk'] / 10.0 + glucose_reward(next_cgm, meal, bolus)
+            reward = 0.0
         total_reward += reward
 
         next_state = build_state(next_cgm, current_cgm, cgm_list[-2],
@@ -309,12 +326,11 @@ def run_episode(explore_noise, episode_num, total_steps):
                 print(f"[train] step={total_steps}  critic={c_loss:.4f}  actor={a_loss}  "
                       f"out_bias={[round(b, 3) for b in agent.actor.head[-1].bias.data.tolist()]}")
 
-
         episode_log.append((step, next_cgm, basal, bolus, reward, meal))
         step += 1
         total_steps += 1
 
-        if done:     
+        if done:
             break
 
     if episode_num % 10 == 0:
@@ -325,16 +341,16 @@ def run_episode(explore_noise, episode_num, total_steps):
     return total_reward, step, total_steps
 
 if __name__ == "__main__":
-    RANDOM_STEPS = 12000
+    RANDOM_STEPS = 12500
     total_steps = 0
     patient = T1DPatient.withName("adult#001")
     sensor = CGMSensor.withName("Dexcom")
     pump = InsulinPump.withName("Insulet")
-    scenario = CustomScenario(start_time=START_TIME, scenario=MEAL_SCENARIOS[0])
+    scenario = CustomScenario(start_time=START_TIME, scenario = [])
     env = CustomT1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
 
     agent = TD3Agent(state_dim=STATE_DIM)
-    explore_noise = 0.07
+    explore_noise = 0.11
     explore_noise_decay = 0.999
     explore_noise_min = 0.005
     best_reward         = -np.inf
@@ -343,10 +359,9 @@ if __name__ == "__main__":
     with open(log_path, "w") as f:
         f.write("TD3 Basal+Bolus Training Log\n")
 
-
     print("Starting RL training (basal + bolus)...")
     start_ep = 0
-    for episode in range(start_ep, 2500):
+    for episode in range(start_ep, start_ep + 3000):
         r, s, total_steps = run_episode(explore_noise, episode + 1, total_steps)
 
         if total_steps >= RANDOM_STEPS:
@@ -360,13 +375,13 @@ if __name__ == "__main__":
             f.write(f"{episode+1},{r:.2f}\n")
 
         if (episode + 1) % 500 == 0:
-            agent.save(SAVE_PATH + f"/checkpoint_{episode+1}")
+            agent.save(BASE + f"/checkpoint_{episode+1}")
 
-        if episode % 10 == 0:
+        if episode % 1 == 0:
             with torch.no_grad():
                 test_s = torch.zeros(1, SEQ_LEN, STATE_DIM).to(device)
                 a = agent.actor(test_s).cpu().numpy()[0]
                 print(f"  Actor sanity: basal={a[0]:.4f} U/hr  bolus={a[1]:.4f} U")
 
-    agent.save(SAVE_PATH + "/final")
+    agent.save(BASE + "/final")
     print(f"Training complete. Best reward: {best_reward:.2f}")

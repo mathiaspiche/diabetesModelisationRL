@@ -119,7 +119,7 @@ def run_eval(agent, scenario_meals, seed):
     }
 
 best = None
-for p in [4000]:
+for p in [5000,5500,6000,6500,7000,7500,8000,8500,9000,9500,10000]:
     path = os.path.join(BASE, f"checkpoint_{p}")
 
     if not os.path.exists(path):
